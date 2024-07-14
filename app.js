@@ -106,6 +106,9 @@ schedule.scheduleJob('*/3 * * * *', async () => {
             connection.createChannel((err, channel) => {
                 if (err) throw err;
                 channel.sendToQueue(queue, Buffer.from(JSON.stringify(rates)));
+                if (queue !== null) {
+                    console.log(`saved: ${queue}`);
+                  }
             });
         });
     } catch (error) {
