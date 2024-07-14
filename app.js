@@ -20,7 +20,8 @@ const sequelize = new Sequelize('currencyDB', 'sa', 'root', {
 const Rate = sequelize.define('rate', {
     currency: Sequelize.STRING,
     rate: Sequelize.FLOAT,
-    timestamp: Sequelize.DATE
+}, {
+    timestamps: true
 });
 
 const Conversion = sequelize.define('conversion', {
@@ -28,7 +29,8 @@ const Conversion = sequelize.define('conversion', {
     toCurrency: Sequelize.STRING,
     amount: Sequelize.FLOAT,
     convertedAmount: Sequelize.FLOAT,
-    timestamp: Sequelize.DATE
+}, {
+    timestamps: true
 });
 
 const User = sequelize.define('user', {
@@ -41,12 +43,20 @@ const User = sequelize.define('user', {
         type: Sequelize.STRING,
         allowNull: false
     }
+}, {
+    timestamps: true
 });
 
 User.beforeCreate(async (user) => {
     const salt = await bcrypt.genSalt(10);
     user.password = await bcrypt.hash(user.password, salt);
 });
+
+Rate.belongsTo(User, { foreignKey: 'userId', as: 'user' });
+Conversion.belongsTo(User, { foreignKey: 'userId', as: 'user' });
+
+User.hasMany(Rate, { foreignKey: 'userId', as: 'rates' });
+User.hasMany(Conversion, { foreignKey: 'userId', as: 'conversions' });
 
 sequelize.sync();
 
@@ -89,32 +99,45 @@ amqp.connect('amqp://localhost', (err, connection) => {
 
 schedule.scheduleJob('*/3 * * * *', async () => {
     try {
-        const response = await axios.get('https://v6.exchangerate-api.com/v6/8f723791cd9e77dcdbafab91/latest/OMR');
-        const rates = response.data.conversion_rates;
-        const timestamp = new Date();
+        const users = await User.findAll();
 
-        Object.keys(rates).forEach(currency => {
-            Rate.create({
-                currency,
-                rate: rates[currency],
-                timestamp
+        users.forEach(async (user) => {
+            const response = await axios.get('https://v6.exchangerate-api.com/v6/8f723791cd9e77dcdbafab91/latest/OMR');
+            const rates = response.data.conversion_rates;
+
+            Object.keys(rates).forEach(async (currency) => {
+                const existingRate = await Rate.findOne({ where: { currency, userId: user.id } });
+
+                if (existingRate) {
+                    existingRate.rate = rates[currency];
+                    await existingRate.save();
+                } else {
+                    await Rate.create({
+                        currency,
+                        rate: rates[currency],
+                        userId: user.id
+                    });
+                }
             });
-        });
 
-        amqp.connect('amqp://localhost', (err, connection) => {
-            if (err) throw err;
-            connection.createChannel((err, channel) => {
+            amqp.connect('amqp://localhost', (err, connection) => {
                 if (err) throw err;
-                channel.sendToQueue(queue, Buffer.from(JSON.stringify(rates)));
-                if (queue !== null) {
-                    console.log(`saved: ${queue}`);
-                  }
+                connection.createChannel((err, channel) => {
+                    if (err) throw err;
+                    channel.sendToQueue(queue, Buffer.from(JSON.stringify(rates)));
+                    if (queue !== null) {
+                        console.log(`saved: ${queue}`);
+                    }
+                });
             });
         });
     } catch (error) {
         console.error(error);
     }
 });
+
+
+
 
 app.post('/register', async (req, res) => {
     const { username, password } = req.body;
@@ -166,43 +189,49 @@ app.get('/rates', passport.authenticate('jwt', { session: false }), async (req, 
     try {
         const rates = await Rate.findAll({
             where: {
-                currency: currencyArray
+                currency: currencyArray,
+                userId: req.user.id
             },
-            order: [['timestamp', 'ASC']]
+            order: [['updatedAt', 'ASC']]
         });
         res.json(rates);
     } catch (error) {
         console.error(error);
-        res.status(500).json({ error: ' error while retrieving rates' });
+        res.status(500).json({ error: 'Error while retrieving rates' });
     }
 });
+
 
 app.post('/convert', passport.authenticate('jwt', { session: false }), async (req, res) => {
     const { fromCurrency, toCurrency, amount } = req.body;
 
-    const fromRate = await Rate.findOne({
-        where: { currency: fromCurrency },
-        order: [['timestamp', 'DESC']]
-    });
+    try {
+        const fromRate = await Rate.findOne({
+            where: { currency: fromCurrency, userId: req.user.id },
+            order: [['updatedAt', 'DESC']]
+        });
 
-    const toRate = await Rate.findOne({
-        where: { currency: toCurrency },
-        order: [['timestamp', 'DESC']]
-    });
+        const toRate = await Rate.findOne({
+            where: { currency: toCurrency, userId: req.user.id },
+            order: [['updatedAt', 'DESC']]
+        });
 
-    const convertedAmount = (amount / fromRate.rate) * toRate.rate;
-    const timestamp = new Date();
+        const convertedAmount = (amount / fromRate.rate) * toRate.rate;
+        const conversion = await Conversion.create({
+            fromCurrency,
+            toCurrency,
+            amount,
+            convertedAmount,
+            userId: req.user.id
+        });
 
-    const conversion = await Conversion.create({
-        fromCurrency,
-        toCurrency,
-        amount,
-        convertedAmount,
-        timestamp
-    });
-
-    res.json(conversion);
+        res.json(conversion);
+    } catch (error) {
+        console.error(error);
+        res.status(500).json({ error: 'Error while performing conversion' });
+    }
 });
+
 
 app.get('/conversions', passport.authenticate('jwt', { session: false }), async (req, res) => {
     const { currencies } = req.query;
@@ -214,19 +243,22 @@ app.get('/conversions', passport.authenticate('jwt', { session: false }), async 
     try {
         const conversions = await Conversion.findAll({
             where: {
+                userId: req.user.id,
                 [Sequelize.Op.or]: [
                     { fromCurrency: currencyArray },
                     { toCurrency: currencyArray }
                 ]
             },
-            order: [['timestamp', 'ASC']]
+            order: [['updatedAt', 'ASC']]
         });
         res.json(conversions);
     } catch (error) {
         console.error(error);
-        res.status(500).json({ error: 'An error while retrieving conversions' });
+        res.status(500).json({ error: 'Error while retrieving conversions' });
     }
 });
+
+
 
 
 const port = process.env.PORT || 3000;
